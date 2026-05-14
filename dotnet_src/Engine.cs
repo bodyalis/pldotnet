@@ -303,7 +303,8 @@ namespace PlDotNET
             // or externally via dotnet build; the external build is the default
             // for F# because of typing and linkage issues with FCS-generated code.string.Empty, userHandlerCode = string.Empty;
             string userFunctionCode = string.Empty, userHandlerCode = string.Empty;
-            MemoryStream memUserFunction, memUserHandler;
+            MemoryStream? memUserFunction = null;
+            MemoryStream? memUserHandler = null;
 
             if (!useUserAssembly && dotnetLanguage == DotNETLanguage.FSharp)
             {
@@ -432,60 +433,66 @@ namespace PlDotNET
             }
             catch (Exception e)
             {
+                memUserFunction?.Dispose();
                 Elog.Warning($"Error encountered: {e.GetType().Name}: {e.Message}");
                 return 1;
             }
 
-            // Load the assemblies into AssemblyLoadContext
-            AssemblyLoadContext userAlc = new ($"UserFunction_{functionId}", true);
-            _ = userAlc.LoadFromAssemblyPath(typeof(NpgsqlCommand).Assembly.Location); // Npgsql Assembly
-            _ = userAlc.LoadFromAssemblyPath(typeof(NpgsqlPoint).Assembly.Location); // NpgsqlTypes Assembly
-            _ = userAlc.LoadFromAssemblyPath(typeof(NullLoggerFactory).Assembly.Location); // Logging Abstractions Assembly
-            _ = userAlc.LoadFromAssemblyPath(typeof(Elog).Assembly.Location); // PlDotNET.Common Assembly
-            _ = userAlc.LoadFromAssemblyPath(typeof(OutputResult).Assembly.Location); // PlDotNET.Handlers Assembly
-            _ = userAlc.LoadFromAssemblyPath(typeof(CommandTests).Assembly.Location); // Npgsql.Tests Assembly
-            _ = userAlc.LoadFromAssemblyPath(typeof(NUnitAttribute).Assembly.Location); // MonoTouch.NUnitLite Assembly
-            _ = dotnetLanguage == DotNETLanguage.FSharp ?
-                userAlc.LoadFromAssemblyPath(typeof(Microsoft.FSharp.Core.FSharpOption<>).Assembly.Location) : null; // FSharp.Core
-            _ = userAlc.LoadFromStream(new MemoryStream(memUserFunction.GetBuffer())); // UserFunction Assembly
-            Assembly userHandlerAssembly = userAlc.LoadFromStream(new MemoryStream(memUserHandler.GetBuffer())); // UserHandler Assembly
-
-            if (is_trigger)
+            try
             {
-                // Create the CachedTFunction to keep the function information
-                CachedTrigger newCachedTFunction = new ()
-                {
-                    UserFunctionSourceCode = userFunctionCode,
-                    UserHandlerSourceCode = userHandlerCode,
-                    FunctionName = funcName,
-                    UserAssemblyLoadContext = userAlc,
-                    UserProcedure = GetDirectTDelegate(userHandlerAssembly),
-                    Language = dotnetLanguage,
-                };
+                // Load the assemblies into AssemblyLoadContext
+                AssemblyLoadContext userAlc = new ($"UserFunction_{functionId}", true);
+                _ = userAlc.LoadFromAssemblyPath(typeof(NpgsqlCommand).Assembly.Location); // Npgsql Assembly
+                _ = userAlc.LoadFromAssemblyPath(typeof(NpgsqlPoint).Assembly.Location); // NpgsqlTypes Assembly
+                _ = userAlc.LoadFromAssemblyPath(typeof(NullLoggerFactory).Assembly.Location); // Logging Abstractions Assembly
+                _ = userAlc.LoadFromAssemblyPath(typeof(Elog).Assembly.Location); // PlDotNET.Common Assembly
+                _ = userAlc.LoadFromAssemblyPath(typeof(OutputResult).Assembly.Location); // PlDotNET.Handlers Assembly
+                _ = userAlc.LoadFromAssemblyPath(typeof(CommandTests).Assembly.Location); // Npgsql.Tests Assembly
+                _ = userAlc.LoadFromAssemblyPath(typeof(NUnitAttribute).Assembly.Location); // MonoTouch.NUnitLite Assembly
+                _ = dotnetLanguage == DotNETLanguage.FSharp ?
+                    userAlc.LoadFromAssemblyPath(typeof(Microsoft.FSharp.Core.FSharpOption<>).Assembly.Location) : null; // FSharp.Core
+                _ = userAlc.LoadFromStream(new MemoryStream(memUserFunction.GetBuffer())); // UserFunction Assembly
+                Assembly userHandlerAssembly = userAlc.LoadFromStream(new MemoryStream(memUserHandler.GetBuffer())); // UserHandler Assembly
 
-                // Add the CachedTFunction in the dictionary where the key is the function Id
-                Engine.TrigBuiltCodeDict.Add(functionId, newCachedTFunction);
+                if (is_trigger)
+                {
+                    // Create the CachedTFunction to keep the function information
+                    CachedTrigger newCachedTFunction = new ()
+                    {
+                        UserFunctionSourceCode = userFunctionCode,
+                        UserHandlerSourceCode = userHandlerCode,
+                        FunctionName = funcName,
+                        UserAssemblyLoadContext = userAlc,
+                        UserProcedure = GetDirectTDelegate(userHandlerAssembly),
+                        Language = dotnetLanguage,
+                    };
+
+                    // Add the CachedTFunction in the dictionary where the key is the function Id
+                    Engine.TrigBuiltCodeDict.Add(functionId, newCachedTFunction);
+                }
+                else
+                {
+                    // Create the CachedFunction to keep the function information
+                    CachedFunction newCachedFunction = new ()
+                    {
+                        UserFunctionSourceCode = userFunctionCode,
+                        UserHandlerSourceCode = userHandlerCode,
+                        FunctionName = funcName,
+                        SupportNullInput = supportNullInput,
+                        UserAssemblyLoadContext = userAlc,
+                        UserProcedure = GetDirectDelegate(userHandlerAssembly),
+                        Language = dotnetLanguage,
+                    };
+
+                    // Add the CachedFunction in the dictionary where the key is the function Id
+                    Engine.FuncBuiltCodeDict.Add(functionId, newCachedFunction);
+                }
             }
-            else
+            finally
             {
-                // Create the CachedFunction to keep the function information
-                CachedFunction newCachedFunction = new ()
-                {
-                    UserFunctionSourceCode = userFunctionCode,
-                    UserHandlerSourceCode = userHandlerCode,
-                    FunctionName = funcName,
-                    SupportNullInput = supportNullInput,
-                    UserAssemblyLoadContext = userAlc,
-                    UserProcedure = GetDirectDelegate(userHandlerAssembly),
-                    Language = dotnetLanguage,
-                };
-
-                // Add the CachedFunction in the dictionary where the key is the function Id
-                Engine.FuncBuiltCodeDict.Add(functionId, newCachedFunction);
+                memUserFunction?.Dispose();
+                memUserHandler?.Dispose();
             }
-
-            memUserFunction.Close();
-            memUserHandler.Close();
 
             return 0;
         }

@@ -407,8 +407,10 @@ void pldotnet_ResizeResult(struct pldotnet_Result *r, size_t length) {
         return;  // unreached
     }
 
-    if (r->values) pfree(r->values);
-    if (r->nulls) pfree(r->nulls);
+    if (r->values)  pfree(r->values);
+    if (r->nulls)   pfree(r->nulls);
+    if (r->oids)    pfree(r->oids);
+    if (r->updated) pfree(r->updated);
 
     r->length = length;
     r->is_null = false;
@@ -552,6 +554,47 @@ static Datum pldotnet_generic_handler(FunctionCallInfo fcinfo, bool is_inline,
         retval =
             pldotnet_CompileAndRunUserFunction(fcinfo, is_inline, language);
 
+        /*
+         * Fix #3: Copy by-reference return values to the parent context
+         * before the temporary execution context is deleted.
+         */
+        if (!fcinfo->isnull && retval != (Datum)0 && !is_inline) {
+            if (CALLED_AS_TRIGGER(fcinfo)) {
+                /*
+                 * Trigger: RETURN_TRIGGER_MODIFY allocates a HeapTuple in
+                 * func_exec_ctx; copy it to the parent context.
+                 * RETURN_NORMAL returns tg_trigtuple/tg_newtuple which live
+                 * outside func_exec_ctx and must NOT be copied (PostgreSQL
+                 * uses pointer identity to detect row modifications).
+                 */
+                TriggerData *tdata = (TriggerData *)fcinfo->context;
+                HeapTuple rettuple = (HeapTuple)DatumGetPointer(retval);
+                if (rettuple != tdata->tg_trigtuple &&
+                    rettuple != tdata->tg_newtuple) {
+                    MemoryContextSwitchTo(memory_context.prev);
+                    retval = PointerGetDatum(heap_copytuple(rettuple));
+                    MemoryContextSwitchTo(memory_context.curr);
+                }
+            } else {
+                /*
+                 * Normal or SRF: for by-reference return types (text, bytea,
+                 * arrays, composites, …), the datum points into func_exec_ctx.
+                 * Copy it to the parent context so the pointer remains valid
+                 * after pldotnet_ResetMemoryContext.
+                 */
+                Oid ret_type = get_func_rettype(fcinfo->flinfo->fn_oid);
+                int16 typlen;
+                bool typbyval;
+                char typalign;
+                get_typlenbyvalalign(ret_type, &typlen, &typbyval, &typalign);
+                if (!typbyval) {
+                    MemoryContextSwitchTo(memory_context.prev);
+                    retval = datumCopy(retval, typbyval, typlen);
+                    MemoryContextSwitchTo(memory_context.curr);
+                }
+            }
+        }
+
         /* REVERT PREV MEM CONTEXT */
         pldotnet_ResetMemoryContext(&memory_context);
     }
@@ -630,14 +673,15 @@ static Datum result_to_record(TupleDesc desc, pldotnet_Result *result,
         }
     }
 
-    // create and return the Datum
+    /* create and return the Datum */
     tuple = heap_form_tuple(desc, result->values, result->nulls);
     if (do_copy) {
         output_datum = heap_copy_tuple_as_datum(tuple, desc);
+        heap_freetuple(tuple);  /* safe: copy already made */
     } else {
         output_datum = PointerGetDatum(tuple);
+        /* caller owns the tuple; do NOT free it here */
     }
-    heap_freetuple(tuple);
     return output_datum;
 }
 
@@ -792,8 +836,9 @@ static Datum pldotnet_execute_trigger(
 
     pfree(tableName);
     pfree(tableSchema);
-    pldotnet_FreeResult(old_row);  // this is safe on NULL
-    pldotnet_FreeResult(new_row);  // this is safe on NULL
+    if (arguments) pfree(arguments);
+    pldotnet_FreeResult(old_row);  /* this is safe on NULL */
+    pldotnet_FreeResult(new_row);  /* this is safe on NULL */
 
     return rv;
 }
@@ -813,10 +858,9 @@ static Datum pldotnet_CompileAndRunUserFunction(const FunctionCallInfo fcinfo,
     int result_type = -1;
     pldotnet_Result *output = NULL;
 
-    // set up initial data
+    /* set up initial data; keep proc/procst pinned until after all uses */
     proc = pldotnet_GetPostgresHeapTuple(fcinfo->flinfo->fn_oid);
     procst = (Form_pg_proc)GETSTRUCT(proc);
-    pldotnet_ReleasePostgresHeapTuple(proc);
     resultTypeId = procst->prorettype;
 
     retset = procst->proretset;
@@ -872,7 +916,7 @@ static Datum pldotnet_CompileAndRunUserFunction(const FunctionCallInfo fcinfo,
                 /* success */
                 break;
             case TYPEFUNC_COMPOSITE_DOMAIN:
-                Assert(prodesc->fn_retisdomain);
+                /* domain over composite — handled the same as COMPOSITE */
                 break;
             case TYPEFUNC_RECORD:
                 /* failed to determine actual type of RECORD */
@@ -921,6 +965,9 @@ static Datum pldotnet_CompileAndRunUserFunction(const FunctionCallInfo fcinfo,
     nullmap = function_decl->support_null_input
                   ? pldotnet_BuildNullArgumentList(fcinfo, procst)
                   : nullptr;
+
+    /* Release the SysCache entry now that proc/procst are no longer needed */
+    pldotnet_ReleasePostgresHeapTuple(proc);
 
     // Handle Set Returning Function
     if (retset) {
@@ -1100,8 +1147,9 @@ static bool pldotnet_GetSourceCode(
     char *input_names;
 
     args_total = get_func_arg_info(proc, &orig_types, &names, &orig_modes);
-    types =
-        pldotnet_TopAllocCopy(orig_types, sizeof(orig_types[0]) * args_total);
+    types = (args_total > 0)
+        ? (Oid *)pldotnet_TopAllocCopy(orig_types, sizeof(orig_types[0]) * args_total)
+        : NULL;
 
     if (!args_total) {
         modes = (char *)nullptr;
@@ -1160,7 +1208,22 @@ static bool pldotnet_GetSourceCode(
             ((InlineCodeBlock *)DatumGetPointer(PG_GETARG_DATUM(0)))
                 ->source_text;
     } else {
-        user_function_decl->func_name = NameStr(procst->proname);
+        /* Copy func_name and func_body to TopMemoryContext so they outlive
+         * both the SysCache release (proc/procst) and the function-execution
+         * memory context deletion (pldotnet_ResetMemoryContext). */
+        {
+            const char *name_temp = NameStr(procst->proname);
+            user_function_decl->func_name =
+                (const char *)pldotnet_TopAllocCopy((void *)name_temp,
+                                                    strlen(name_temp) + 1);
+        }
+        {
+            const char *body_temp = pldotnet_GetFunctionBody(proc, procst);
+            user_function_decl->func_body =
+                (const char *)pldotnet_TopAllocCopy((void *)body_temp,
+                                                    strlen(body_temp) + 1);
+            pfree((void *)body_temp);
+        }
         user_function_decl->func_ret_type = procst->prorettype;
         user_function_decl->func_param_names = input_names;
         user_function_decl->func_param_types = types;
@@ -1170,7 +1233,6 @@ static bool pldotnet_GetSourceCode(
         user_function_decl->num_args = args_total;
         user_function_decl->num_input_args = args_in;
         user_function_decl->num_output_values = args_out;
-        user_function_decl->func_body = pldotnet_GetFunctionBody(proc, procst);
         user_function_decl->retset = procst->proretset;
         // user_function_decl->is_trigger = CALLED_AS_TRIGGER(fcinfo);
         user_function_decl->is_trigger = (procst->prorettype == TRIGGEROID);
@@ -1296,6 +1358,28 @@ static void pldotnet_SaveFunction(pldotnet_UserFunctionDeclaration *function,
                              (gpointer)function);
 }
 
+/*
+ * GHashTable value-destructor for pldotnet_UserFunctionDeclaration entries.
+ * Called automatically when a key is replaced (CREATE OR REPLACE FUNCTION)
+ * or when the hash table is destroyed (_PG_fini).
+ * Only registered (non-inline) functions are stored in the hash table, so
+ * func_name and func_body are always TopMemoryContext-palloc'd copies.
+ */
+void pldotnet_FreeFunctionDecl(gpointer ptr) {
+    pldotnet_UserFunctionDeclaration *decl =
+        (pldotnet_UserFunctionDeclaration *)ptr;
+    if (!decl) return;
+    /* func_name and func_body are TopMemoryContext copies (pldotnet_TopAllocCopy) */
+    if (decl->func_name)        pfree((void *)decl->func_name);
+    if (decl->func_body)        pfree((void *)decl->func_body);
+    /* param arrays are also TopMemoryContext allocations */
+    if (decl->func_param_names) pfree(decl->func_param_names);
+    if (decl->func_param_types) pfree(decl->func_param_types);
+    if (decl->func_param_modes) pfree(decl->func_param_modes);
+    /* decl->language is a compile-time string literal; do NOT pfree it */
+    pfree(decl);
+}
+
 static const char *pldotnet_GetFunctionBody(HeapTuple proc,
                                             Form_pg_proc procst) {
     bool isnull = false;
@@ -1311,8 +1395,8 @@ static char *pldotnet_GetSqlParamsName(char **names, int input_names) {
     size_t buffer_size = 0;
     int written = 0;
 
-    if (!names) return "";
-    if (*names == 0) return "";
+    if (!names) return NULL;
+    if (*names == 0) return NULL;
 
     for (int i = 0; i < input_names; i++) {
         buffer_size += strlen(names[i]);
@@ -1337,7 +1421,7 @@ static char *pldotnet_GetSqlParamsName(char **names, int input_names) {
         }
         written += new_written;
     }
-    sql_params[buffer_size] = 0;  // NUL-terminate the string as a courtesy
+    sql_params[buffer_size - 1] = 0;  /* NUL-terminate the string as a courtesy */
 
     return sql_params;
 }

@@ -52,15 +52,22 @@ void _PG_init(void) {
         elog(ERROR, "[pldotnet]: Could not obtain C# Methods.");
 
     procedures =
-        g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL, NULL);
+        g_hash_table_new_full(g_direct_hash, g_direct_equal, NULL,
+                              pldotnet_FreeFunctionDecl);
 }
 
 /**
  * @brief On startup, pldotnet removes the function cache.
  */
 void _PG_fini(void) {
-    /* destroys the global hash table */
+    /* destroys the global hash table, freeing all cached function declarations */
     g_hash_table_destroy(procedures);
+
+    /* free the root_path string that was strdup'd in _PG_init */
+    if (root_path) {
+        free(root_path);
+        root_path = NULL;
+    }
 
     /* TODO: shutdown dotnet runtime */
 }

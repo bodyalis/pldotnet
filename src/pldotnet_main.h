@@ -291,4 +291,13 @@ extern PGDLLEXPORT int pldotnet_GetResultLength(pldotnet_Result *result);
 extern PGDLLEXPORT void pldotnet_ResizeResult(struct pldotnet_Result *r,
                                               size_t length);
 
+/**
+ * @brief GHashTable value-destructor for cached function declarations.
+ * Frees all TopMemoryContext-palloc'd fields and the declaration struct itself.
+ * Passed as the value_destroy_func to g_hash_table_new_full().
+ *
+ * @param ptr Pointer to the pldotnet_UserFunctionDeclaration to free.
+ */
+extern void pldotnet_FreeFunctionDecl(gpointer ptr);
+
 #endif  // PLDOTNET_MAIN_H_
